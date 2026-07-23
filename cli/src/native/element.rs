@@ -476,6 +476,35 @@ async fn scroll_node_into_view(client: &CdpClient, session_id: &str, backend_nod
         .await;
 }
 
+/// True when the resolved node is still attached to its document
+/// (`Node.isConnected`). `DOM.resolveNode` happily returns an objectId for a
+/// node that has been removed from the tree but not yet garbage-collected, so
+/// callers that rely on layout geometry must confirm connectivity before
+/// trusting a cached backend_node_id. Best effort: on any CDP failure we assume
+/// connected (`true`) so a transient protocol error never silently discards a
+/// live node.
+async fn is_node_connected(client: &CdpClient, session_id: &str, object_id: &str) -> bool {
+    let result = client
+        .send_command(
+            "Runtime.callFunctionOn",
+            Some(serde_json::json!({
+                "objectId": object_id,
+                "functionDeclaration": "function() { return this.isConnected === true; }",
+                "returnByValue": true,
+            })),
+            Some(session_id),
+        )
+        .await;
+    match result {
+        Ok(value) => value
+            .get("result")
+            .and_then(|r| r.get("value"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true),
+        Err(_) => true,
+    }
+}
+
 pub async fn resolve_element_object_id(
     client: &CdpClient,
     session_id: &str,
@@ -507,10 +536,23 @@ pub async fn resolve_element_object_id(
 
             if let Ok(r) = result {
                 if let Some(object_id) = r.object.object_id {
-                    return Ok((object_id, effective_session_id.to_string()));
+                    // DOM.resolveNode succeeds even for a node that has been
+                    // detached from the document (e.g. after `innerHTML = ''`):
+                    // the backend node is still alive in memory, so this is NOT
+                    // a reliable staleness signal on its own. A detached node has
+                    // no layout box, so a downstream getContentQuads/getBoxModel
+                    // would report "no visible area" — masking a ref that should
+                    // have been re-resolved via role/name. Verify the node is
+                    // still connected; if not, fall through to the fallback.
+                    // A genuinely display:none-but-attached node stays connected
+                    // and is intentionally left to fail as NoVisibleArea downstream.
+                    if is_node_connected(client, effective_session_id, &object_id).await {
+                        return Ok((object_id, effective_session_id.to_string()));
+                    }
                 }
             }
-            // backend_node_id is stale; re-query the accessibility tree below
+            // backend_node_id is stale (or detached); re-query the accessibility
+            // tree below.
         }
 
         // Fallback: re-query the accessibility tree to find a fresh node by role/name
@@ -824,6 +866,72 @@ fn intercepted_error(target: &str, blocker: &str) -> String {
         "Element '{}' is covered by <{}> at its click point, so the input would land on that element instead. Dismiss or interact with the covering element first (it is often a dialog, banner, or sticky header).",
         target, blocker
     )
+}
+
+/// Compute the center of a quad (8 floats: x1,y1,x2,y2,x3,y3,x4,y4).
+pub(super) fn quad_center(quad: &[f64]) -> Result<(f64, f64), String> {
+    if quad.len() < 8 {
+        return Err(format!("Expected quad with 8 values, got {}", quad.len()));
+    }
+    let x = (quad[0] + quad[2] + quad[4] + quad[6]) / 4.0;
+    let y = (quad[1] + quad[3] + quad[5] + quad[7]) / 4.0;
+    Ok((x, y))
+}
+
+/// Like `resolve_element_center` but uses `DOM.scrollIntoViewIfNeeded` +
+/// `DOM.getContentQuads` instead of `DOM.getBoxModel`. This correctly handles
+/// CSS-transformed elements (e.g. virtualized list items with `transform: translateY`).
+pub async fn resolve_element_center_quads(
+    client: &CdpClient,
+    session_id: &str,
+    ref_map: &RefMap,
+    selector_or_ref: &str,
+    iframe_sessions: &HashMap<String, String>,
+) -> Result<(f64, f64, String), String> {
+    // Resolve to an object_id (works for both refs and CSS selectors)
+    let (object_id, effective_session_id) = resolve_element_object_id(
+        client,
+        session_id,
+        ref_map,
+        selector_or_ref,
+        iframe_sessions,
+    )
+    .await?;
+
+    // Scroll element into view if needed
+    let _: Value = client
+        .send_command_typed(
+            "DOM.scrollIntoViewIfNeeded",
+            &DomScrollIntoViewIfNeededParams {
+                backend_node_id: None,
+                node_id: None,
+                object_id: Some(object_id.clone()),
+            },
+            Some(&effective_session_id),
+        )
+        .await
+        .unwrap_or(Value::Null); // Ignore errors (element may already be visible)
+
+    // Get content quads (accounts for CSS transforms)
+    let result: DomGetContentQuadsResult = client
+        .send_command_typed(
+            "DOM.getContentQuads",
+            &DomGetContentQuadsParams {
+                backend_node_id: None,
+                node_id: None,
+                object_id: Some(object_id),
+            },
+            Some(&effective_session_id),
+        )
+        .await?;
+
+    let quad = result
+        .quads
+        .first()
+        .ok_or_else(|| "DOM.getContentQuads returned no quads".to_string())?;
+
+    let (x, y) = quad_center(quad)?;
+    Ok((x, y, effective_session_id))
 }
 
 fn box_model_center(model: &BoxModel) -> (f64, f64) {

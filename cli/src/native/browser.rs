@@ -137,6 +137,16 @@ fn active_page_index_after_removal(
 /// Converts common error messages into AI-friendly, actionable descriptions.
 pub fn to_ai_friendly_error(error: &str) -> String {
     let lower = error.to_lowercase();
+    // Our own actionability transaction already emits rich, AI-friendly messages
+    // (covering element + coordinates, viewport geometry, remediation advice) and
+    // prefixes them with "actionability:". Pass those through untouched — never run
+    // them through the keyword classifier below. The Intercepted variant in
+    // particular literally contains the word "intercepted", which the generic
+    // `contains("intercept")` branch would otherwise flatten into a vague sentence,
+    // discarding the "covered by <tag#id>" detail agents rely on.
+    if lower.starts_with("actionability:") {
+        return error.to_string();
+    }
     // Classify a genuine locator miss first: its anchored shape ("No element
     // found: ...") echoes the selector/name, which may itself contain a word like
     // "timeout" or "intercept". The broad substring checks below would otherwise

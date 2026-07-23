@@ -422,6 +422,13 @@ fn parse_command_inner(args: &[String], flags: &Flags) -> Result<Value, ParseErr
                 Ok(json!({ "id": id, "action": "click", "selector": sel }))
             }
         }
+        "click-js" => {
+            let sel = rest.first().ok_or_else(|| ParseError::MissingArguments {
+                context: "click-js".to_string(),
+                usage: "click-js <selector>",
+            })?;
+            Ok(json!({ "id": id, "action": "click-js", "selector": sel }))
+        }
         "dblclick" => {
             let sel = rest.first().ok_or_else(|| ParseError::MissingArguments {
                 context: "dblclick".to_string(),
@@ -1699,6 +1706,25 @@ fn parse_command_inner(args: &[String], flags: &Flags) -> Result<Value, ParseErr
                 }),
             }
         }
+        // === Video (record active tab — no new context, preserves auth) ===
+        "video" => match rest.first().copied() {
+            Some("start") => {
+                let path = rest.get(1).ok_or_else(|| ParseError::MissingArguments {
+                    context: "video start".to_string(),
+                    usage: "video start <output.webm>",
+                })?;
+                Ok(json!({ "id": id, "action": "video_start", "path": path }))
+            }
+            Some("stop") => Ok(json!({ "id": id, "action": "video_stop" })),
+            Some(sub) => Err(ParseError::UnknownSubcommand {
+                subcommand: sub.to_string(),
+                valid_options: &["start", "stop"],
+            }),
+            None => Err(ParseError::MissingArguments {
+                context: "video".to_string(),
+                usage: "video <start|stop> [path]",
+            }),
+        },
         "console" => {
             let clear = rest.contains(&"--clear");
             Ok(json!({ "id": id, "action": "console", "clear": clear }))

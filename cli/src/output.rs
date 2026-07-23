@@ -2698,6 +2698,37 @@ Examples:
 "##
         }
 
+        // === Video (active tab recording) ===
+        "video" => {
+            r##"
+agent-browser video - Record active tab to video (auth-safe)
+
+Usage: agent-browser video start <path.webm>
+       agent-browser video stop
+
+Record the currently active tab to a WebM video file.
+Unlike 'record', this does NOT create a new browser context.
+It captures the existing authenticated page directly, so login
+state (cookies, localStorage, sessionStorage) is preserved.
+
+Use this instead of 'record' when the app requires auth.
+
+Operations:
+  start <path>     Start recording the active tab
+  stop             Stop recording and save video
+
+Global Options:
+  --json               Output as JSON
+  --session <name>     Use specific session
+
+Examples:
+  agent-browser open https://app.example.com/dashboard
+  agent-browser video start ./demo.webm
+  agent-browser click @e3
+  agent-browser video stop
+"##
+        }
+
         // === Console/Errors ===
         "console" => {
             r##"
@@ -3573,8 +3604,10 @@ Debug:
   trace start                Start Chrome DevTools trace
   trace stop [path]          Stop and save Chrome DevTools trace
   profiler start|stop [path] Record Chrome DevTools profile
-  record start <path> [url]  Start video recording (WebM)
+  record start <path> [url]  Start video recording (new context, WebM)
   record stop                Stop and save video
+  video start <path>         Record active tab (no new context, auth-safe)
+  video stop                 Stop and save video
   console [--clear]          View console logs
   errors [--clear]           View page errors
   highlight <sel>            Highlight element

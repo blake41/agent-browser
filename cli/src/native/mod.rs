@@ -1,6 +1,8 @@
 #[allow(dead_code)]
 pub mod a11y;
 #[allow(dead_code)]
+pub mod actionability;
+#[allow(dead_code)]
 pub mod actions;
 #[allow(dead_code)]
 pub mod auth;

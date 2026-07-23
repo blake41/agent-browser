@@ -2820,6 +2820,7 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
         "snapshot" => handle_snapshot(cmd, state).await,
         "screenshot" => handle_screenshot(cmd, state).await,
         "click" => handle_click(cmd, state).await,
+        "click-js" => handle_click_js(cmd, state).await,
         "dblclick" => handle_dblclick(cmd, state).await,
         "fill" => handle_fill(cmd, state).await,
         "type" => handle_type(cmd, state).await,
@@ -5690,6 +5691,38 @@ async fn handle_click(cmd: &Value, state: &mut DaemonState) -> Result<Value, Str
     let click_count = cmd.get("clickCount").and_then(|v| v.as_i64()).unwrap_or(1) as i32;
 
     let result = interaction::click(
+        &mgr.client,
+        &session_id,
+        &state.ref_map,
+        selector,
+        button,
+        click_count,
+        &state.iframe_sessions,
+    )
+    .await?;
+
+    if result.dialog_opened {
+        state.pending_pointer_release = result.pending_release;
+        return Ok(json!({ "clicked": selector, "dialogOpened": true }));
+    }
+    Ok(json!({ "clicked": selector }))
+}
+
+/// Unverified escape hatch: click via `DOM.getContentQuads` coordinates without
+/// the actionability hit-test. Mirrors `handle_click`'s dialog handling.
+async fn handle_click_js(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
+    let selector = cmd
+        .get("selector")
+        .and_then(|v| v.as_str())
+        .ok_or("Missing 'selector' parameter")?;
+
+    let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
+    let session_id = mgr.active_session_id()?.to_string();
+
+    let button = cmd.get("button").and_then(|v| v.as_str()).unwrap_or("left");
+    let click_count = cmd.get("clickCount").and_then(|v| v.as_i64()).unwrap_or(1) as i32;
+
+    let result = interaction::click_js(
         &mgr.client,
         &session_id,
         &state.ref_map,

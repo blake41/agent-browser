@@ -412,6 +412,34 @@ pub struct BoxModel {
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct DomScrollIntoViewIfNeededParams {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backend_node_id: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub node_id: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub object_id: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DomGetContentQuadsParams {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backend_node_id: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub node_id: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub object_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DomGetContentQuadsResult {
+    pub quads: Vec<Vec<f64>>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct DomQuerySelectorParams {
     pub node_id: i64,
     pub selector: String,

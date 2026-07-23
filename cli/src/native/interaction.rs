@@ -2,9 +2,12 @@ use std::collections::HashMap;
 
 use serde_json::Value;
 
+use super::actionability::resolve_actionable_point;
 use super::cdp::client::CdpClient;
 use super::cdp::types::*;
-use super::element::{resolve_element_center, resolve_element_object_id, RefMap};
+use super::element::{
+    resolve_element_center, resolve_element_center_quads, resolve_element_object_id, RefMap,
+};
 
 /// Outcome of a click. `dialog_opened` is true if a JavaScript dialog opened
 /// mid-sequence (the page is then blocked until `dialog accept`/`dismiss`).
@@ -34,7 +37,63 @@ pub async fn click(
     click_count: i32,
     iframe_sessions: &HashMap<String, String>,
 ) -> Result<ClickResult, String> {
-    let (x, y, effective_session_id) = resolve_element_center(
+    // Two-phase click:
+    //
+    // 1. Actionability transaction (ours): scrollIntoView -> getContentQuads ->
+    //    viewport-clip -> elementFromPoint hit-test. On failure we propagate the
+    //    ActionabilityError as a String and stop — callers must NOT silently fall
+    //    back to a JS click. The explicit `click_js` verb stays available as the
+    //    unverified escape hatch for cases where actionability rejects but the
+    //    caller knows better (or wants to diagnose why it rejected).
+    //
+    // 2. Dialog-aware dispatch (upstream's `dispatch_click`, unchanged): each
+    //    mouse event is raced against Page.javascriptDialogOpening, and the
+    //    pending-release timing subtlety (a button held when a dialog opens
+    //    between mousePressed and mouseReleased) lives entirely inside it. We
+    //    never construct a ClickResult by hand.
+    let point = resolve_actionable_point(
+        client,
+        session_id,
+        ref_map,
+        selector_or_ref,
+        iframe_sessions,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+    // A click-triggered dialog can fire on the frame's own session (OOPIF,
+    // carried on point.session_id) or on the top-level page session; both count
+    // as "ours". A dialog on any other session belongs to a background tab and
+    // must not abort this click.
+    dispatch_click(
+        client,
+        &point.session_id,
+        &[point.session_id.as_str(), session_id],
+        point.x,
+        point.y,
+        button,
+        click_count,
+    )
+    .await
+}
+
+/// Click using `DOM.getContentQuads` for coordinate calculation, WITHOUT the
+/// actionability hit-test. Handles CSS-transformed elements (e.g. virtualized
+/// list items) correctly.
+///
+/// This is the explicit *unverified* escape hatch: unlike `click`, it does not
+/// run the elementFromPoint hit-test, so it will happily dispatch at a point
+/// that is covered or offscreen. It still dispatches through the dialog-aware
+/// `dispatch_click`, so it returns a `ClickResult` exactly like `click`.
+pub async fn click_js(
+    client: &CdpClient,
+    session_id: &str,
+    ref_map: &RefMap,
+    selector_or_ref: &str,
+    button: &str,
+    click_count: i32,
+    iframe_sessions: &HashMap<String, String>,
+) -> Result<ClickResult, String> {
+    let (x, y, effective_session_id) = resolve_element_center_quads(
         client,
         session_id,
         ref_map,
@@ -42,9 +101,6 @@ pub async fn click(
         iframe_sessions,
     )
     .await?;
-    // A click-triggered dialog can fire on the frame's own session (OOPIF) or
-    // on the top-level page session; both count as "ours". A dialog on any
-    // other session belongs to a background tab and must not abort this click.
     dispatch_click(
         client,
         &effective_session_id,

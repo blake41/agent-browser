@@ -7536,6 +7536,486 @@ async fn e2e_recording_rejects_invalid_fps() {
 }
 
 // ---------------------------------------------------------------------------
+// tab new: session setup inheritance
+// ---------------------------------------------------------------------------
+
+/// `tab new <url>` must replay the session's setup onto the new tab before
+/// its first document: an init script registered on the primary page has to
+/// run on the initial load, not only after a later navigation.
+#[tokio::test]
+#[ignore]
+async fn e2e_tab_new_inherits_init_script_on_first_load() {
+    let mut state = DaemonState::new();
+
+    let resp = execute_command(
+        &json!({ "id": "1", "action": "launch", "headless": true }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let resp = execute_command(
+        &json!({ "id": "2", "action": "addinitscript", "script": "window.__abTab = 'seeded';" }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let resp = execute_command(
+        &json!({
+            "id": "3", "action": "tab_new",
+            "url": "data:text/html,<script>document.title = String(window.__abTab)</script>",
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let resp = execute_command(
+        &json!({ "id": "4", "action": "evaluate", "script": "document.title" }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    assert_eq!(
+        get_data(&resp)["result"],
+        "seeded",
+        "init script should run on the new tab's first document"
+    );
+
+    let resp = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;
+    assert_success(&resp);
+}
+
+/// Replayed init scripts receive target-specific CDP identifiers. Removing a
+/// script from the new tab must translate the original user-facing identifier
+/// for every tab where Chrome registered it.
+#[tokio::test]
+#[ignore]
+async fn e2e_tab_new_removes_replayed_init_script_by_original_identifier() {
+    let mut state = DaemonState::new();
+
+    let resp = execute_command(
+        &json!({ "id": "1", "action": "launch", "headless": true }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let first = execute_command(
+        &json!({
+            "id": "2", "action": "addinitscript",
+            "script": "window.__abFirstInit = true;",
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&first);
+    let first_id = get_data(&first)["identifier"]
+        .as_str()
+        .expect("first init script should return an identifier")
+        .to_string();
+
+    let second = execute_command(
+        &json!({
+            "id": "3", "action": "addinitscript",
+            "script": "window.__abSecondInit = true;",
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&second);
+    let second_id = get_data(&second)["identifier"]
+        .as_str()
+        .expect("second init script should return an identifier")
+        .to_string();
+
+    let resp = execute_command(
+        &json!({ "id": "4", "action": "removeinitscript", "identifier": first_id }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let resp = execute_command(
+        &json!({
+            "id": "5", "action": "tab_new",
+            "url": "data:text/html,<title>new tab</title>",
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let resp = execute_command(
+        &json!({ "id": "6", "action": "removeinitscript", "identifier": second_id }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let resp = execute_command(
+        &json!({
+            "id": "7", "action": "navigate",
+            "url": "data:text/html,<title>after removal</title>",
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let resp = execute_command(
+        &json!({
+            "id": "8", "action": "evaluate",
+            "script": "window.__abSecondInit === true",
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    assert_eq!(get_data(&resp)["result"], false);
+
+    let resp = execute_command(
+        &json!({ "id": "9", "action": "tab_switch", "tabId": "t1" }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let resp = execute_command(
+        &json!({
+            "id": "10", "action": "navigate",
+            "url": "data:text/html,<title>original after removal</title>",
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let resp = execute_command(
+        &json!({
+            "id": "11", "action": "evaluate",
+            "script": "window.__abSecondInit === true",
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    assert_eq!(
+        get_data(&resp)["result"],
+        false,
+        "removing a replayed script should also remove its original registration"
+    );
+
+    let resp = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;
+    assert_success(&resp);
+}
+
+/// CDP allocates init-script identifiers independently in each target. Two
+/// pre-existing tabs can therefore both return `1` for different scripts, but
+/// the daemon must expose distinct handles and remove only the requested one.
+#[tokio::test]
+#[ignore]
+async fn e2e_tab_init_script_handles_are_unique_across_preexisting_tabs() {
+    let mut state = DaemonState::new();
+
+    let resp = execute_command(
+        &json!({ "id": "1", "action": "launch", "headless": true }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let resp = execute_command(&json!({ "id": "2", "action": "tab_new" }), &mut state).await;
+    assert_success(&resp);
+
+    let resp = execute_command(
+        &json!({ "id": "3", "action": "tab_switch", "tabId": "t1" }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let first = execute_command(
+        &json!({
+            "id": "4", "action": "addinitscript",
+            "script": "window.__abFirstExistingTab = true;",
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&first);
+    let first_id = get_data(&first)["identifier"]
+        .as_str()
+        .expect("first init script should return an identifier")
+        .to_string();
+
+    let resp = execute_command(
+        &json!({ "id": "5", "action": "tab_switch", "tabId": "t2" }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let second = execute_command(
+        &json!({
+            "id": "6", "action": "addinitscript",
+            "script": "window.__abSecondExistingTab = true;",
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&second);
+    let second_id = get_data(&second)["identifier"]
+        .as_str()
+        .expect("second init script should return an identifier")
+        .to_string();
+
+    assert_ne!(first_id, second_id, "user-facing handles must be unique");
+
+    let resp = execute_command(
+        &json!({ "id": "7", "action": "removeinitscript", "identifier": second_id }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let resp = execute_command(
+        &json!({
+            "id": "8", "action": "tab_new",
+            "url": "data:text/html,<title>future tab</title>",
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let resp = execute_command(
+        &json!({
+            "id": "9", "action": "evaluate",
+            "script": "[window.__abFirstExistingTab === true, window.__abSecondExistingTab === true]",
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    assert_eq!(get_data(&resp)["result"], json!([true, false]));
+
+    let resp = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;
+    assert_success(&resp);
+}
+
+/// `click --new-tab` creates a tab through a separate handler from `tab new`,
+/// but it must apply the same session setup before the first request.
+#[tokio::test]
+#[ignore]
+async fn e2e_click_new_tab_inherits_user_agent_and_headers() {
+    let (base_url, _server) = start_echo_server().await;
+    let mut state = DaemonState::new();
+
+    let resp = execute_command(
+        &json!({
+            "id": "1", "action": "launch", "headless": true,
+            "userAgent": "ab-click-new-tab-test/1.0",
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let resp = execute_command(
+        &json!({ "id": "2", "action": "headers", "headers": { "X-Global": "global" } }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let resp = execute_command(
+        &json!({
+            "id": "3", "action": "navigate",
+            "url": format!("data:text/html,<a id='next' href='{}/click'>next</a>", base_url),
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let resp = execute_command(
+        &json!({ "id": "4", "action": "click", "selector": "#next", "newTab": true }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let resp = execute_command(
+        &json!({
+            "id": "5", "action": "evaluate",
+            "script": "JSON.parse(document.body.innerText)",
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let headers = &get_data(&resp)["result"]["headers"];
+    assert_eq!(headers["X-Global"], "global");
+    assert_eq!(headers["User-Agent"], "ab-click-new-tab-test/1.0");
+
+    let resp = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;
+    assert_success(&resp);
+}
+
+/// Clearing headers and offline mode restores the default setup, so future
+/// tabs can use the non-blocking target creation path.
+#[tokio::test]
+#[ignore]
+async fn e2e_cleared_session_setup_is_not_pending() {
+    let mut state = DaemonState::new();
+
+    let resp = execute_command(
+        &json!({ "id": "1", "action": "launch", "headless": true }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let resp = execute_command(
+        &json!({ "id": "2", "action": "offline", "offline": false }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let resp = execute_command(
+        &json!({ "id": "3", "action": "headers", "headers": {} }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    assert!(state.session_setup.offline.is_none());
+    assert!(state.session_setup.extra_headers.is_none());
+
+    let resp = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;
+    assert_success(&resp);
+}
+
+/// The launch `--user-agent` (Emulation.setUserAgentOverride) and global
+/// `set headers` (Network.setExtraHTTPHeaders) are per CDP session. A new tab
+/// opened with a URL must send both on its very first document request.
+#[tokio::test]
+#[ignore]
+async fn e2e_tab_new_inherits_user_agent_and_headers() {
+    let (base_url, _server) = start_echo_server().await;
+    let mut state = DaemonState::new();
+
+    let resp = execute_command(
+        &json!({
+            "id": "1", "action": "launch", "headless": true,
+            "userAgent": "ab-tab-new-test/1.0",
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let resp = execute_command(
+        &json!({ "id": "2", "action": "headers", "headers": { "X-Global": "global" } }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let resp = execute_command(
+        &json!({ "id": "3", "action": "tab_new", "url": format!("{}/tab", base_url) }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let resp = execute_command(
+        &json!({
+            "id": "4", "action": "evaluate",
+            "script": "JSON.parse(document.body.innerText)",
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let headers = &get_data(&resp)["result"]["headers"];
+    assert_eq!(
+        headers["X-Global"], "global",
+        "global `headers` should apply to the new tab's first document request, got {headers}"
+    );
+    assert_eq!(
+        headers["User-Agent"], "ab-tab-new-test/1.0",
+        "new tab's first document request should carry the launch user agent, got {headers}"
+    );
+
+    let resp = execute_command(
+        &json!({ "id": "5", "action": "evaluate", "script": "navigator.userAgent" }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    assert_eq!(get_data(&resp)["result"], "ab-tab-new-test/1.0");
+
+    let resp = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;
+    assert_success(&resp);
+}
+
+/// `set credentials` uses target-scoped extra headers, so a new tab must send
+/// the resulting Authorization header on its first document request.
+#[tokio::test]
+#[ignore]
+async fn e2e_tab_new_inherits_http_credentials_on_first_load() {
+    let (base_url, _server) = start_echo_server().await;
+    let mut state = DaemonState::new();
+
+    let resp = execute_command(
+        &json!({ "id": "1", "action": "launch", "headless": true }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let resp = execute_command(
+        &json!({
+            "id": "2", "action": "credentials",
+            "username": "tab-user", "password": "tab-password",
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let resp = execute_command(
+        &json!({ "id": "3", "action": "tab_new", "url": format!("{}/credentials", base_url) }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let resp = execute_command(
+        &json!({
+            "id": "4", "action": "evaluate",
+            "script": "JSON.parse(document.body.innerText)",
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let expected = format!("Basic {}", STANDARD.encode("tab-user:tab-password"));
+    assert_eq!(
+        get_data(&resp)["result"]["headers"]["Authorization"],
+        expected,
+        "HTTP credentials should apply to the new tab's first document request"
+    );
+
+    let resp = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;
+    assert_success(&resp);
+}
+
+// ---------------------------------------------------------------------------
 // --state / storageState flag: cookies should be loaded at launch time
 // ---------------------------------------------------------------------------
 

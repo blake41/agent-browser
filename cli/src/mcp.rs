@@ -850,7 +850,7 @@ fn tools() -> Vec<Value> {
             "Click an element by @ref or CSS selector.",
             json!({
                 "selector": selector_schema(),
-                "newTab": { "type": "boolean", "default": false, "description": "Open link targets in a new tab." }
+                "newTab": { "type": "boolean", "default": false, "description": "Open link targets in a new tab after applying session setup." }
             }),
             &["selector"],
         ),
@@ -1171,7 +1171,7 @@ fn parity_tools() -> Vec<Value> {
         tool(
             TOOL_SET_CREDENTIALS,
             "Set credentials",
-            "Set HTTP credentials.",
+            "Set HTTP credentials for the current tab and tabs opened later.",
             json!({ "username": { "type": "string" }, "password": { "type": "string" } }),
             &["username", "password"],
         ),
@@ -1276,7 +1276,7 @@ fn parity_tools() -> Vec<Value> {
         tool(
             TOOL_TAB_NEW,
             "Tab new",
-            "Open a new tab.",
+            "Open a new tab after applying session setup before its first navigation.",
             json!({ "url": { "type": "string" }, "label": { "type": "string" } }),
             &[],
         ),
@@ -1665,7 +1665,7 @@ fn parity_tools() -> Vec<Value> {
         tool(
             TOOL_REMOVE_INIT_SCRIPT,
             "Remove init script",
-            "Remove a registered init script.",
+            "Remove a registered init script from every tab in the session.",
             json!({ "id": { "type": "string" } }),
             &["id"],
         ),

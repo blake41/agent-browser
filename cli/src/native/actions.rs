@@ -413,6 +413,105 @@ fn apply_effective_ca_cert(
     options.ca_cert_digest = effective_ca_cert.as_ref().map(|ca| *ca.bundle.digest());
 }
 
+/// Arguments of the last `Emulation.setEmulatedMedia` call, kept so the same
+/// emulation can be replayed onto a new page session.
+#[derive(Debug, Clone)]
+pub struct EmulatedMedia {
+    pub media: Option<String>,
+    /// `(name, value)` media features, e.g. `("prefers-color-scheme", "dark")`.
+    pub features: Vec<(String, String)>,
+}
+
+/// An init script tracked across target sessions.
+///
+/// Chrome assigns script identifiers independently in each target session, so
+/// two tabs can both return the same identifier for different scripts. The
+/// daemon-owned `identifier` is the user-facing handle, while
+/// `session_identifiers` records the target-local identifier to send when
+/// removing it from a particular target.
+#[derive(Debug, Clone)]
+pub struct InitScriptSetup {
+    pub identifier: String,
+    pub source: String,
+    pub session_identifiers: HashMap<String, String>,
+}
+
+/// Page-level setup the daemon has applied to the active page session.
+///
+/// CDP scopes all of these to a single target session, so a tab the daemon
+/// creates itself starts without them. This record lets
+/// [`apply_session_setup`] replay them onto the new tab before its first
+/// navigation. Reset whenever a browser is (re)launched. Permissions are not
+/// tracked: `Browser.grantPermissions` is context-scoped and already covers
+/// new tabs in the default context.
+#[derive(Debug, Default, Clone)]
+pub struct SessionSetup {
+    /// `--user-agent`, `useragent`, or the UA half of `device`.
+    pub user_agent: Option<String>,
+    /// Last `Emulation.setEmulatedMedia` call: `--color-scheme` at launch or
+    /// `set_media` / `emulatemedia`.
+    pub emulated_media: Option<EmulatedMedia>,
+    pub timezone: Option<String>,
+    pub locale: Option<String>,
+    /// `(latitude, longitude, accuracy)`.
+    pub geolocation: Option<(f64, f64, Option<f64>)>,
+    /// Global headers from the `headers` and `credentials` commands
+    /// (`Network.setExtraHTTPHeaders`). Origin-scoped `--headers` live in
+    /// `DaemonState::origin_headers`.
+    pub extra_headers: Option<HashMap<String, String>>,
+    pub offline: Option<bool>,
+    /// Init scripts registered with `Page.addScriptToEvaluateOnNewDocument`:
+    /// `--enable`, `--init-script`, plugin init scripts, and `addinitscript`.
+    pub init_scripts: Vec<InitScriptSetup>,
+    /// Monotonic source for daemon-owned init-script handles. CDP identifiers
+    /// cannot be used here because each target session allocates them
+    /// independently, commonly starting at `1`.
+    next_init_script_handle: u64,
+}
+
+impl SessionSetup {
+    fn from_launch_options(options: &LaunchOptions) -> Self {
+        Self {
+            user_agent: options.user_agent.clone(),
+            emulated_media: options.color_scheme.as_ref().map(|scheme| EmulatedMedia {
+                media: None,
+                features: vec![("prefers-color-scheme".to_string(), scheme.clone())],
+            }),
+            ..Self::default()
+        }
+    }
+
+    /// True when nothing has been configured, so there is nothing to replay.
+    fn is_empty(&self) -> bool {
+        self.user_agent.is_none()
+            && self.emulated_media.is_none()
+            && self.timezone.is_none()
+            && self.locale.is_none()
+            && self.geolocation.is_none()
+            && self.extra_headers.as_ref().is_none_or(HashMap::is_empty)
+            && !self.offline.unwrap_or(false)
+            && self.init_scripts.is_empty()
+    }
+
+    fn register_init_script(
+        &mut self,
+        source: String,
+        session_id: String,
+        session_identifier: String,
+    ) -> String {
+        self.next_init_script_handle += 1;
+        let identifier = format!("init-script-{}", self.next_init_script_handle);
+        let mut session_identifiers = HashMap::new();
+        session_identifiers.insert(session_id, session_identifier);
+        self.init_scripts.push(InitScriptSetup {
+            identifier: identifier.clone(),
+            source,
+            session_identifiers,
+        });
+        identifier
+    }
+}
+
 pub struct DaemonState {
     pub browser: Option<BrowserManager>,
     pub appium: Option<AppiumManager>,
@@ -515,6 +614,9 @@ pub struct DaemonState {
     /// Last viewport settings (width, height, deviceScaleFactor, mobile),
     /// re-applied to new contexts (e.g., recording).
     pub viewport: Option<(i32, i32, f64, bool)>,
+    /// Session-scoped setup applied to the active page, re-applied to tabs the
+    /// daemon creates. See [`SessionSetup`].
+    pub session_setup: SessionSetup,
     /// Init script sources returned by launch mutator plugins for this launch.
     pub plugin_init_scripts: Vec<String>,
     /// Provider cleanup metadata for the active external browser session.
@@ -632,6 +734,7 @@ impl DaemonState {
                 .and_then(|s| s.parse::<u64>().ok())
                 .unwrap_or(25_000),
             viewport: None,
+            session_setup: SessionSetup::default(),
             plugin_init_scripts: Vec::new(),
             active_provider_session: None,
             active_provider_connection: false,
@@ -3541,6 +3644,141 @@ async fn install_network_controls_or_resume_prepared_session(
     }
 }
 
+/// True when [`apply_session_setup`] has anything to replay onto a new tab.
+async fn session_setup_pending(state: &DaemonState) -> bool {
+    !state.session_setup.is_empty()
+        || !state.routes.read().await.is_empty()
+        || !state.origin_headers.read().await.is_empty()
+}
+
+/// Replay the session-scoped setup the user configured on the active page
+/// (see [`SessionSetup`]) onto a tab the daemon just created, plus the
+/// `Fetch.enable` needed for `route` and origin-scoped `--headers` to reach
+/// the shared fetch handler from that tab.
+///
+/// Call after `Page`/`Network` are enabled on `session_id` and before its
+/// first navigation, so init scripts, UA, and headers cover the initial
+/// document. Emulation failures are ignored: a call the engine rejects
+/// should not abort creating the tab.
+async fn apply_session_setup(state: &mut DaemonState, session_id: &str) -> Result<(), String> {
+    let client = state
+        .browser
+        .as_ref()
+        .ok_or("Browser not launched")?
+        .client
+        .clone();
+    let setup = state.session_setup.clone();
+
+    if let Some(ref ua) = setup.user_agent {
+        let _ = client
+            .send_command(
+                "Emulation.setUserAgentOverride",
+                Some(json!({ "userAgent": ua })),
+                Some(session_id),
+            )
+            .await;
+    }
+
+    if let Some(ref emulated) = setup.emulated_media {
+        let mut params = json!({});
+        if let Some(ref m) = emulated.media {
+            params["media"] = Value::String(m.clone());
+        }
+        if !emulated.features.is_empty() {
+            params["features"] = Value::Array(
+                emulated
+                    .features
+                    .iter()
+                    .map(|(name, value)| json!({ "name": name, "value": value }))
+                    .collect(),
+            );
+        }
+        let _ = client
+            .send_command("Emulation.setEmulatedMedia", Some(params), Some(session_id))
+            .await;
+    }
+
+    if let Some(ref tz) = setup.timezone {
+        let _ = client
+            .send_command(
+                "Emulation.setTimezoneOverride",
+                Some(json!({ "timezoneId": tz })),
+                Some(session_id),
+            )
+            .await;
+    }
+
+    if let Some(ref locale) = setup.locale {
+        let _ = client
+            .send_command(
+                "Emulation.setLocaleOverride",
+                Some(json!({ "locale": locale })),
+                Some(session_id),
+            )
+            .await;
+    }
+
+    if let Some((lat, lon, accuracy)) = setup.geolocation {
+        let _ = client
+            .send_command(
+                "Emulation.setGeolocationOverride",
+                Some(json!({
+                    "latitude": lat,
+                    "longitude": lon,
+                    "accuracy": accuracy.unwrap_or(1.0),
+                })),
+                Some(session_id),
+            )
+            .await;
+    }
+
+    if let Some(ref headers) = setup.extra_headers {
+        network::set_extra_headers(&client, session_id, headers).await?;
+    }
+
+    if let Some(offline) = setup.offline {
+        network::set_offline(&client, session_id, offline).await?;
+    }
+
+    for (index, script) in setup.init_scripts.iter().enumerate() {
+        let result = client
+            .send_command(
+                "Page.addScriptToEvaluateOnNewDocument",
+                Some(json!({ "source": &script.source })),
+                Some(session_id),
+            )
+            .await?;
+        let identifier = result
+            .get("identifier")
+            .and_then(Value::as_str)
+            .ok_or("Page.addScriptToEvaluateOnNewDocument returned no identifier")?;
+        let tracked = state
+            .session_setup
+            .init_scripts
+            .get_mut(index)
+            .ok_or("Init script setup changed while it was being applied")?;
+        tracked
+            .session_identifiers
+            .insert(session_id.to_string(), identifier.to_string());
+    }
+
+    // `route` and origin-scoped `--headers` are resolved by the background
+    // fetch handler for any session, but only sessions with Fetch enabled
+    // emit requestPaused. Domain filtering and proxy auth install their own
+    // Fetch.enable; this covers the case where neither is active.
+    let has_routes = !state.routes.read().await.is_empty();
+    let has_origin_headers = !state.origin_headers.read().await.is_empty();
+    if has_routes || has_origin_headers {
+        let patterns = build_fetch_patterns(state).await;
+        let params = build_fetch_enable_params(state, patterns).await;
+        client
+            .send_command("Fetch.enable", Some(params), Some(session_id))
+            .await?;
+    }
+
+    Ok(())
+}
+
 async fn auto_launch(
     state: &mut DaemonState,
     plugins: Vec<crate::plugins::PluginConfig>,
@@ -3549,6 +3787,7 @@ async fn auto_launch(
     let effective_ca_cert = state.effective_ca_cert.clone();
     apply_effective_ca_cert(&mut options, &effective_ca_cert);
     state.plugin_init_scripts.clear();
+    state.session_setup = SessionSetup::default();
 
     // Use the stream server's viewport dimensions for --window-size so the
     // content area matches the desired viewport from the start.
@@ -3781,6 +4020,7 @@ async fn auto_launch(
     if let Some(ref ca) = effective_ca_cert {
         options.prepared_nss_home = Some(prepare_nss_home(&ca.bundle)?);
     }
+    state.session_setup = SessionSetup::from_launch_options(&options);
     let mgr = BrowserManager::launch(options, engine.as_deref()).await?;
     state.reset_input_state();
     state.browser = Some(mgr);
@@ -3852,18 +4092,16 @@ fn allowed_domains_from_launch_command(cmd: &Value) -> Option<Vec<String>> {
 }
 
 async fn apply_launch_init_scripts(
-    state: &DaemonState,
+    state: &mut DaemonState,
     enable_features: &[String],
     init_script_paths: &[String],
 ) {
-    let Some(mgr) = state.browser.as_ref() else {
-        return;
-    };
+    let mut sources: Vec<String> = Vec::new();
 
     for feature in enable_features {
         match feature.as_str() {
             "react-devtools" | "react" => {
-                let _ = mgr.add_script_to_evaluate(react::INSTALL_HOOK_JS).await;
+                sources.push(react::INSTALL_HOOK_JS.to_string());
             }
             other => {
                 eprintln!("warning: unknown --enable feature '{}'", other);
@@ -3873,17 +4111,34 @@ async fn apply_launch_init_scripts(
 
     for path in init_script_paths {
         match fs::read_to_string(path) {
-            Ok(source) => {
-                let _ = mgr.add_script_to_evaluate(&source).await;
-            }
+            Ok(source) => sources.push(source),
             Err(e) => {
                 eprintln!("warning: failed to read --init-script '{}': {}", path, e);
             }
         }
     }
 
-    for source in &state.plugin_init_scripts {
-        let _ = mgr.add_script_to_evaluate(source).await;
+    sources.extend(state.plugin_init_scripts.iter().cloned());
+
+    let Some(mgr) = state.browser.as_ref() else {
+        return;
+    };
+    let Ok(session_id) = mgr.active_session_id().map(str::to_string) else {
+        return;
+    };
+
+    let mut registered = Vec::with_capacity(sources.len());
+    for source in sources {
+        let session_identifier = mgr
+            .add_script_to_evaluate(&source)
+            .await
+            .unwrap_or_default();
+        registered.push((source, session_identifier));
+    }
+    for (source, session_identifier) in registered {
+        state
+            .session_setup
+            .register_init_script(source, session_id.clone(), session_identifier);
     }
 }
 
@@ -4544,6 +4799,7 @@ async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
         return Ok(json!({ "launched": true, "reused": true, "relaunchedBrowser": false }));
     }
     state.ref_map.clear();
+    state.session_setup = SessionSetup::default();
 
     let has_cdp = cdp_url.is_some() || cdp_port.is_some();
     super::browser::validate_launch_options(
@@ -4730,6 +4986,7 @@ async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
     write_engine_file(&state.session_id, &state.engine);
     write_extensions_file_from_paths(&state.session_id, launch_options.extensions.as_deref());
     state.reset_input_state();
+    state.session_setup = SessionSetup::from_launch_options(&launch_options);
     state.browser = Some(BrowserManager::launch(launch_options, engine.as_deref()).await?);
     state.launch_hash = Some(new_hash);
     state.subscribe_to_browser_events();
@@ -5125,6 +5382,7 @@ async fn handle_close(state: &mut DaemonState) -> Result<Value, String> {
         let mut map = state.origin_headers.write().await;
         map.clear();
     }
+    state.session_setup = SessionSetup::default();
 
     if let Some(server) = state.inspect_server.take() {
         server.shutdown();
@@ -5376,28 +5634,31 @@ async fn handle_click(cmd: &Value, state: &mut DaemonState) -> Result<Value, Str
             has_proxy_creds,
             Some(&href),
         )?;
+        // `click --new-tab` creates the same kind of daemon-owned tab as
+        // `tab new`, so it must use the same pre-navigation setup path.
+        let defer_url = defer_url_until_controls || session_setup_pending(state).await;
 
         state.ref_map.clear();
-        {
+        state.active_iframe_sessions.clear();
+        state.active_frame_id = None;
+        state.webmcp.clear_invocations();
+        let new_session_id = {
             let mgr = state.browser.as_mut().ok_or("Browser not launched")?;
-            mgr.tab_new(
-                if defer_url_until_controls {
-                    None
-                } else {
-                    Some(&href)
-                },
-                None,
-            )
-            .await?;
-        }
+            mgr.tab_new(if defer_url { None } else { Some(&href) }, None)
+                .await?;
+            mgr.active_session_id()?.to_string()
+        };
 
+        apply_session_setup(state, &new_session_id).await?;
         install_network_controls_or_close(state, has_proxy_creds).await?;
         state.drain_cdp_events_background().await?;
 
-        if defer_url_until_controls {
+        if defer_url {
             let mgr = state.browser.as_mut().ok_or("Browser not launched")?;
             mgr.navigate(&href, WaitUntil::Load).await?;
         }
+
+        state.refresh_active_iframe_sessions().await;
 
         return Ok(json!({ "clicked": selector, "newTab": true, "url": href }));
     }
@@ -6217,7 +6478,7 @@ async fn handle_setcontent(cmd: &Value, state: &DaemonState) -> Result<Value, St
     Ok(json!({ "set": true }))
 }
 
-async fn handle_headers(cmd: &Value, state: &DaemonState) -> Result<Value, String> {
+async fn handle_headers(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
     let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
     let session_id = mgr.active_session_id()?.to_string();
 
@@ -6233,14 +6494,19 @@ async fn handle_headers(cmd: &Value, state: &DaemonState) -> Result<Value, Strin
         .unwrap_or_default();
 
     network::set_extra_headers(&mgr.client, &session_id, &headers).await?;
+    // A fresh target already has no extra headers, so an empty map clears the
+    // inherited setup instead of forcing later tabs through deferred loading.
+    state.session_setup.extra_headers = (!headers.is_empty()).then_some(headers);
     Ok(json!({ "set": true }))
 }
 
-async fn handle_offline(cmd: &Value, state: &DaemonState) -> Result<Value, String> {
+async fn handle_offline(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
     let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
     let session_id = mgr.active_session_id()?.to_string();
     let offline = cmd.get("offline").and_then(|v| v.as_bool()).unwrap_or(true);
     network::set_offline(&mgr.client, &session_id, offline).await?;
+    // Online is the default for a fresh target and needs no replay.
+    state.session_setup.offline = offline.then_some(true);
     Ok(json!({ "offline": offline }))
 }
 
@@ -6601,21 +6867,29 @@ async fn handle_tab_new(cmd: &Value, state: &mut DaemonState) -> Result<Value, S
     let has_proxy_creds = state.proxy_credentials.read().await.is_some();
     let defer_url_until_controls =
         should_defer_url_until_network_controls(domain_filter.as_ref(), has_proxy_creds, url)?;
+    // UA, init scripts, headers, and routes are per-session in CDP, so when
+    // any are configured the tab is created blank and navigated only after
+    // they are replayed onto it; otherwise the first document would miss them.
+    let defer_url =
+        defer_url_until_controls || (url.is_some() && session_setup_pending(state).await);
 
     state.ref_map.clear();
     state.active_iframe_sessions.clear();
     state.active_frame_id = None;
     state.webmcp.clear_invocations();
-    let mut result = {
+    let (mut result, new_session_id) = {
         let mgr = state.browser.as_mut().ok_or("Browser not launched")?;
-        mgr.tab_new(if defer_url_until_controls { None } else { url }, label)
-            .await?
+        let result = mgr
+            .tab_new(if defer_url { None } else { url }, label)
+            .await?;
+        (result, mgr.active_session_id()?.to_string())
     };
 
+    apply_session_setup(state, &new_session_id).await?;
     install_network_controls_or_close(state, has_proxy_creds).await?;
     state.drain_cdp_events_background().await?;
 
-    if defer_url_until_controls {
+    if defer_url {
         if let Some(url) = url {
             let nav = {
                 let mgr = state.browser.as_mut().ok_or("Browser not launched")?;
@@ -6746,17 +7020,18 @@ async fn handle_viewport(cmd: &Value, state: &mut DaemonState) -> Result<Value, 
     Ok(json!({ "width": width, "height": height, "deviceScaleFactor": scale, "mobile": mobile }))
 }
 
-async fn handle_user_agent(cmd: &Value, state: &DaemonState) -> Result<Value, String> {
+async fn handle_user_agent(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
     let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
     let ua = cmd
         .get("userAgent")
         .and_then(|v| v.as_str())
         .ok_or("Missing 'userAgent' parameter")?;
     mgr.set_user_agent(ua).await?;
+    state.session_setup.user_agent = Some(ua.to_string());
     Ok(json!({ "userAgent": ua }))
 }
 
-async fn handle_set_media(cmd: &Value, state: &DaemonState) -> Result<Value, String> {
+async fn handle_set_media(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
     let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
     let media = cmd.get("media").and_then(|v| v.as_str());
 
@@ -6778,10 +7053,14 @@ async fn handle_set_media(cmd: &Value, state: &DaemonState) -> Result<Value, Str
     let features = if feat_list.is_empty() {
         None
     } else {
-        Some(feat_list)
+        Some(feat_list.clone())
     };
 
     mgr.set_emulated_media(media, features).await?;
+    state.session_setup.emulated_media = Some(EmulatedMedia {
+        media: media.map(String::from),
+        features: feat_list,
+    });
     Ok(json!({ "set": true }))
 }
 
@@ -7462,7 +7741,7 @@ async fn handle_bringtofront(state: &DaemonState) -> Result<Value, String> {
     Ok(json!({ "broughtToFront": true }))
 }
 
-async fn handle_timezone(cmd: &Value, state: &DaemonState) -> Result<Value, String> {
+async fn handle_timezone(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
     let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
     let timezone = cmd
         .get("timezoneId")
@@ -7470,20 +7749,22 @@ async fn handle_timezone(cmd: &Value, state: &DaemonState) -> Result<Value, Stri
         .and_then(|v| v.as_str())
         .ok_or("Missing 'timezoneId' parameter")?;
     mgr.set_timezone(timezone).await?;
+    state.session_setup.timezone = Some(timezone.to_string());
     Ok(json!({ "timezoneId": timezone }))
 }
 
-async fn handle_locale(cmd: &Value, state: &DaemonState) -> Result<Value, String> {
+async fn handle_locale(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
     let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
     let locale = cmd
         .get("locale")
         .and_then(|v| v.as_str())
         .ok_or("Missing 'locale' parameter")?;
     mgr.set_locale(locale).await?;
+    state.session_setup.locale = Some(locale.to_string());
     Ok(json!({ "locale": locale }))
 }
 
-async fn handle_geolocation(cmd: &Value, state: &DaemonState) -> Result<Value, String> {
+async fn handle_geolocation(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
     let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
     let latitude = cmd
         .get("latitude")
@@ -7496,6 +7777,7 @@ async fn handle_geolocation(cmd: &Value, state: &DaemonState) -> Result<Value, S
     let accuracy = cmd.get("accuracy").and_then(|v| v.as_f64());
 
     mgr.set_geolocation(latitude, longitude, accuracy).await?;
+    state.session_setup.geolocation = Some((latitude, longitude, accuracy));
     Ok(json!({ "latitude": latitude, "longitude": longitude }))
 }
 
@@ -7628,8 +7910,9 @@ async fn handle_addscript(cmd: &Value, state: &DaemonState) -> Result<Value, Str
     Ok(json!({ "added": true }))
 }
 
-async fn handle_addinitscript(cmd: &Value, state: &DaemonState) -> Result<Value, String> {
+async fn handle_addinitscript(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
     let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
+    let session_id = mgr.active_session_id()?.to_string();
     let source = cmd
         .get("script")
         .or_else(|| cmd.get("source"))
@@ -7637,17 +7920,68 @@ async fn handle_addinitscript(cmd: &Value, state: &DaemonState) -> Result<Value,
         .and_then(|v| v.as_str())
         .ok_or("Missing 'script' parameter")?;
 
-    let identifier = mgr.add_script_to_evaluate(source).await?;
+    let session_identifier = mgr.add_script_to_evaluate(source).await?;
+    let identifier = state.session_setup.register_init_script(
+        source.to_string(),
+        session_id,
+        session_identifier,
+    );
     Ok(json!({ "added": true, "identifier": identifier }))
 }
 
-async fn handle_removeinitscript(cmd: &Value, state: &DaemonState) -> Result<Value, String> {
-    let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
+async fn handle_removeinitscript(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
     let identifier = cmd
         .get("identifier")
         .and_then(|v| v.as_str())
         .ok_or("Missing 'identifier' parameter")?;
-    mgr.remove_script_to_evaluate(identifier).await?;
+    let (client, active_session_id, live_session_ids) = {
+        let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
+        (
+            mgr.client.clone(),
+            mgr.active_session_id()?.to_string(),
+            mgr.pages_list()
+                .into_iter()
+                .map(|page| page.session_id)
+                .collect::<HashSet<_>>(),
+        )
+    };
+    let tracked_index = state
+        .session_setup
+        .init_scripts
+        .iter()
+        .position(|script| script.identifier == identifier);
+
+    // Daemon-owned handles are session-wide. Remove each target-local CDP
+    // registration before dropping the source that would reach future tabs.
+    if let Some(index) = tracked_index {
+        let session_identifiers = state.session_setup.init_scripts[index]
+            .session_identifiers
+            .clone();
+        for (session_id, session_identifier) in session_identifiers {
+            if !live_session_ids.contains(&session_id) {
+                continue;
+            }
+            client
+                .send_command(
+                    "Page.removeScriptToEvaluateOnNewDocument",
+                    Some(json!({ "identifier": session_identifier })),
+                    Some(&session_id),
+                )
+                .await?;
+            state.session_setup.init_scripts[index]
+                .session_identifiers
+                .remove(&session_id);
+        }
+        state.session_setup.init_scripts.remove(index);
+    } else {
+        client
+            .send_command(
+                "Page.removeScriptToEvaluateOnNewDocument",
+                Some(json!({ "identifier": identifier })),
+                Some(&active_session_id),
+            )
+            .await?;
+    }
     Ok(json!({ "removed": true, "identifier": identifier }))
 }
 
@@ -8089,6 +8423,7 @@ async fn handle_device(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
     mgr.set_user_agent(ua).await?;
 
     state.viewport = Some((width, height, scale, mobile));
+    state.session_setup.user_agent = Some(ua.to_string());
 
     // Update stream server viewport so status messages and screencast use the new dimensions
     if let Some(ref server) = state.stream_server {
@@ -11039,7 +11374,7 @@ async fn handle_request_detail(cmd: &Value, state: &mut DaemonState) -> Result<V
     Ok(result)
 }
 
-async fn handle_http_credentials(cmd: &Value, state: &DaemonState) -> Result<Value, String> {
+async fn handle_http_credentials(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
     let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
     let session_id = mgr.active_session_id()?.to_string();
     let username = cmd
@@ -11059,6 +11394,9 @@ async fn handle_http_credentials(cmd: &Value, state: &DaemonState) -> Result<Val
     let mut headers = HashMap::new();
     headers.insert("Authorization".to_string(), format!("Basic {}", encoded));
     network::set_extra_headers(&mgr.client, &session_id, &headers).await?;
+    // Network.setExtraHTTPHeaders replaces the target's complete global
+    // header set, so keep the same replacement ready for tabs opened later.
+    state.session_setup.extra_headers = Some(headers);
 
     Ok(json!({ "set": true }))
 }
@@ -13832,6 +14170,48 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
         assert_eq!(state.mouse_state.x, 0.0);
         assert_eq!(state.mouse_state.y, 0.0);
         assert_eq!(state.mouse_state.buttons, 0);
+    }
+
+    #[test]
+    fn test_session_setup_treats_cleared_values_as_empty() {
+        let mut setup = SessionSetup {
+            extra_headers: Some(HashMap::new()),
+            offline: Some(false),
+            ..SessionSetup::default()
+        };
+        assert!(setup.is_empty());
+
+        setup.offline = Some(true);
+        assert!(!setup.is_empty());
+
+        setup.offline = None;
+        setup
+            .extra_headers
+            .as_mut()
+            .unwrap()
+            .insert("X-Test".to_string(), "set".to_string());
+        assert!(!setup.is_empty());
+    }
+
+    #[test]
+    fn test_init_script_handles_are_independent_from_session_identifiers() {
+        let mut setup = SessionSetup::default();
+        let first = setup.register_init_script(
+            "window.first = true".to_string(),
+            "session-a".to_string(),
+            "1".to_string(),
+        );
+        let second = setup.register_init_script(
+            "window.second = true".to_string(),
+            "session-b".to_string(),
+            "1".to_string(),
+        );
+
+        assert_eq!(first, "init-script-1");
+        assert_eq!(second, "init-script-2");
+        assert_eq!(setup.init_scripts.len(), 2);
+        assert_eq!(setup.init_scripts[0].session_identifiers["session-a"], "1");
+        assert_eq!(setup.init_scripts[1].session_identifiers["session-b"], "1");
     }
 
     #[test]

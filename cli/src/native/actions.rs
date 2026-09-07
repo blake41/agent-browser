@@ -1076,7 +1076,9 @@ impl DaemonState {
     }
 
     /// Attach the recorder's own CDP session to the page behind `session_id`
-    /// and spawn the task that screencasts it into ffmpeg.
+    /// and spawn the task that screencasts into ffmpeg. The caller verifies
+    /// ffmpeg before any navigation or restart teardown. Failures here roll the
+    /// recording state back so the next `record start` is not blocked.
     async fn start_recording_task(
         &mut self,
         client: Arc<CdpClient>,
@@ -1091,8 +1093,21 @@ impl DaemonState {
         {
             Ok(capture_session) => capture_session,
             Err(e) => {
-                // `recording_start` already marked the state active.
-                self.recording_state.active = false;
+                self.rollback_failed_recording_start().await;
+                return Err(e);
+            }
+        };
+        let ffmpeg = match recording::spawn_ffmpeg(
+            &self.recording_state.output_path,
+            self.recording_state.fps,
+        ) {
+            Ok(ffmpeg) => ffmpeg,
+            Err(e) => {
+                recording::detach_capture_session(&client, &capture_session).await;
+                if let Ok(mut guard) = self.recording_state.capture_session.lock() {
+                    *guard = None;
+                }
+                self.rollback_failed_recording_start().await;
                 return Err(e);
             }
         };
@@ -1102,7 +1117,7 @@ impl DaemonState {
         let handle = recording::spawn_recording_task(
             client,
             capture_session,
-            self.recording_state.output_path.clone(),
+            ffmpeg,
             self.recording_state.fps,
             shared_count.clone(),
             shared_captured.clone(),
@@ -1113,6 +1128,14 @@ impl DaemonState {
         self.recording_state.shared_captured_count = Some(shared_captured);
         self.recording_state.cancel_tx = Some(cancel_tx);
         Ok(())
+    }
+
+    /// Reconcile every externally visible recording flag after startup fails.
+    async fn rollback_failed_recording_start(&mut self) {
+        self.recording_state.active = false;
+        if let Some(ref server) = self.stream_server {
+            server.set_recording(false, &self.engine).await;
+        }
     }
 
     async fn stop_recording_task(&mut self) -> Result<(), String> {
@@ -7293,8 +7316,10 @@ async fn handle_recording_start(cmd: &Value, state: &mut DaemonState) -> Result<
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty());
 
-    // Validate the rate before any browser work so a bad value costs nothing.
+    // Validate the rate and output path before any browser work so a bad value
+    // costs nothing.
     let fps = recording_fps_from_command(cmd)?;
+    recording::validate_output_path(path)?;
 
     {
         let domain_filter = state.domain_filter.read().await;
@@ -7306,6 +7331,13 @@ async fn handle_recording_start(cmd: &Value, state: &mut DaemonState) -> Result<
     if state.recording_state.active {
         return Err("Recording already active".to_string());
     }
+    if state.browser.is_none() {
+        return Err("Browser not launched".to_string());
+    }
+
+    // Check the external dependency before an optional navigation mutates the
+    // active page. State is still inactive, so a failure needs no rollback.
+    recording::check_ffmpeg_available().await?;
 
     if let Some(url) = recording_url {
         navigate_active_page(state, url, WaitUntil::Load).await?;
@@ -7350,7 +7382,8 @@ async fn handle_recording_restart(cmd: &Value, state: &mut DaemonState) -> Resul
         .filter(|s| !s.is_empty())
         .map(String::from);
 
-    // Validate the rate before stopping the in-flight take.
+    // Validate the path and rate before stopping the in-flight take.
+    recording::validate_output_path(path)?;
     let fps = recording_fps_from_command(cmd)?;
 
     {
@@ -7358,6 +7391,12 @@ async fn handle_recording_restart(cmd: &Value, state: &mut DaemonState) -> Resul
         if let Some(ref url) = recording_url {
             check_url_allowed_by_filter(domain_filter.as_ref(), url)?;
         }
+    }
+
+    // Preserve the in-flight take when the replacement cannot start. A
+    // restart without a browser keeps its existing state-only behavior.
+    if state.browser.is_some() {
+        recording::check_ffmpeg_available().await?;
     }
 
     let _ = state.stop_recording_task().await;
@@ -10398,10 +10437,12 @@ async fn handle_video_start(cmd: &Value, state: &mut DaemonState) -> Result<Valu
     }
 
     let fps = recording_fps_from_command(cmd)?;
+    recording::validate_output_path(path)?;
 
     let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
     let session_id = mgr.active_session_id()?.to_string();
 
+    recording::check_ffmpeg_available().await?;
     recording::recording_start(&mut state.recording_state, path, fps)?;
     state
         .start_recording_task(mgr.client.clone(), session_id)
@@ -13571,6 +13612,139 @@ mod tests {
         assert!(error.contains("allowed domains"), "got: {}", error);
         assert!(state.recording_state.active);
         assert_eq!(state.recording_state.output_path, "/tmp/current.webm");
+    }
+
+    /// A browser-side attachment failure happens before ffmpeg opens the
+    /// destination, so an existing recording must remain untouched.
+    #[tokio::test]
+    #[ignore]
+    async fn e2e_recording_attach_failure_preserves_existing_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let output_path = dir.path().join("existing.webm");
+        fs::write(&output_path, b"existing recording").unwrap();
+
+        let mut state = DaemonState::new();
+        handle_launch(&json!({ "action": "launch", "headless": true }), &mut state)
+            .await
+            .expect("browser should launch");
+
+        recording::recording_start(
+            &mut state.recording_state,
+            output_path.to_str().unwrap(),
+            None,
+        )
+        .unwrap();
+        let client = state.browser.as_ref().unwrap().client.clone();
+        let error = state
+            .start_recording_task(client, "invalid-recording-session".to_string())
+            .await
+            .expect_err("invalid session should fail attachment");
+        let contents_after_failure = fs::read(&output_path);
+
+        let _ = close_current_browser(&mut state).await;
+
+        assert!(error.to_ascii_lowercase().contains("session"), "{error}");
+        assert_eq!(
+            contents_after_failure.unwrap(),
+            b"existing recording",
+            "a failed start must preserve the previous destination"
+        );
+    }
+
+    /// A failed ffmpeg preflight preserves both the active recording and the
+    /// status published to stream and dashboard clients.
+    #[tokio::test]
+    #[ignore]
+    async fn e2e_recording_failed_restart_preserves_active_recording() {
+        use futures_util::StreamExt;
+        use tokio_tungstenite::tungstenite::Message;
+
+        let guard = EnvGuard::new(&["PATH", "AGENT_BROWSER_SOCKET_DIR", "AGENT_BROWSER_SESSION"]);
+        let original_path = std::env::var("PATH").unwrap_or_default();
+        let socket_dir = tempfile::tempdir().unwrap();
+        let empty_path = tempfile::tempdir().unwrap();
+        guard.set(
+            "AGENT_BROWSER_SOCKET_DIR",
+            socket_dir.path().to_str().unwrap(),
+        );
+        guard.set("AGENT_BROWSER_SESSION", "failed-record-restart");
+
+        let mut state = DaemonState::new();
+        handle_launch(&json!({ "action": "launch", "headless": true }), &mut state)
+            .await
+            .expect("browser should launch");
+        let status = handle_stream_enable(&json!({ "port": 0 }), &mut state)
+            .await
+            .expect("stream should start");
+        let port = status["port"].as_u64().unwrap() as u16;
+        let previous_path = socket_dir.path().join("previous.webm");
+        handle_recording_start(
+            &json!({
+                "action": "recording_start",
+                "path": previous_path.to_string_lossy()
+            }),
+            &mut state,
+        )
+        .await
+        .expect("initial recording should start");
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        let restarted_path = socket_dir.path().join("restarted.webm");
+        guard.set("PATH", empty_path.path().to_str().unwrap());
+        let error = handle_recording_restart(
+            &json!({
+                "action": "recording_restart",
+                "path": restarted_path.to_string_lossy()
+            }),
+            &mut state,
+        )
+        .await;
+        let error = error.expect_err("restart should fail without ffmpeg");
+        let active_after_failure = state.recording_state.active;
+
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}"))
+            .await
+            .expect("stream client should connect");
+        let reported_recording = loop {
+            let message = tokio::time::timeout(std::time::Duration::from_secs(5), ws.next())
+                .await
+                .expect("status should arrive")
+                .expect("stream should stay open")
+                .expect("status should be readable");
+            if let Message::Text(text) = message {
+                let value: Value = serde_json::from_str(&text).unwrap();
+                if value["type"] == "status" {
+                    break value["recording"].as_bool().unwrap();
+                }
+            }
+        };
+
+        guard.set("PATH", &original_path);
+        let stop = handle_recording_stop(&mut state)
+            .await
+            .expect("preserved recording should still stop normally");
+        let _ = ws.close(None).await;
+        let _ = handle_stream_disable(&mut state).await;
+        let _ = close_current_browser(&mut state).await;
+        let _ = fs::remove_file(previous_path);
+
+        assert!(error.contains("ffmpeg"), "{error}");
+        assert!(
+            active_after_failure,
+            "failed replacement must leave the current recording active"
+        );
+        assert!(
+            reported_recording,
+            "stream clients must still see the preserved recording"
+        );
+        assert!(
+            stop["frames"].as_u64().unwrap_or(0) > 0,
+            "preserved recording should keep capturing frames"
+        );
+        assert!(
+            !restarted_path.exists(),
+            "failed preflight must not create the replacement output"
+        );
     }
 
     #[tokio::test]
